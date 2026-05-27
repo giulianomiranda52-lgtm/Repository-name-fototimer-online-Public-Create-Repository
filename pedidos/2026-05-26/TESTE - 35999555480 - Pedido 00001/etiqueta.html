@@ -1,0 +1,30 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Etiqueta Pedido 00001</title>
+<style>
+@page { size: 10cm 5cm; margin: 0; }
+body { margin: 0; font-family: Arial; }
+.etiqueta { width: 10cm; height: 5cm; box-sizing: border-box; padding: 0.35cm; border: 1px solid #000; font-size: 12px; }
+h2 { margin: 0 0 5px 0; font-size: 18px; }
+p { margin: 2px 0; }
+.tabela { margin-top: 5px; font-size: 11px; }
+.linha { display: flex; justify-content: space-between; border-bottom: 1px dotted #777; }
+.botao { margin-top: 10px; }
+@media print { .botao { display: none; } }
+</style>
+</head>
+<body>
+<div class="etiqueta">
+<h2>Pedido 00001</h2>
+<p><b>Cliente:</b> TESTE</p>
+<p><b>Telefone:</b> 35999555480</p>
+<p><b>Data:</b> 26/05/2026, 23:22:21</p>
+<p><b>Fotos:</b> 8 arquivos / 8 cópias</p>
+<div class="tabela"><div class="linha"><span>10x15 Brilho SemBorda</span><span>8x</span></div></div>
+<button class="botao" onclick="window.print()">Imprimir etiqueta</button>
+</div>
+</body>
+</html>

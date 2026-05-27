@@ -1,0 +1,15 @@
+{
+  "name": "fototimer-online-pro",
+  "version": "2.0.0",
+  "description": "FotoTimer Online Pro - sistema profissional para envio remoto de fotos",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "archiver": "^5.3.2",
+    "express": "latest",
+    "express-session": "latest",
+    "multer": "latest"
+  }
+}
