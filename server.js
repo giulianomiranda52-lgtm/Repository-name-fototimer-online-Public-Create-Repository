@@ -1,714 +1,146 @@
-const express = require('express');
-const multer = require('multer');
-const fs = require('fs');
-const path = require('path');
-const archiver = require('archiver');
-const session = require('express-session');
 
-const app = express();
-const PORTA = process.env.PORT || 3000;
-const SENHA_ADMIN = process.env.ADMIN_PASSWORD || '1234';
+const express=require('express'),multer=require('multer'),fs=require('fs'),path=require('path'),archiver=require('archiver'),session=require('express-session'),bcrypt=require('bcryptjs'),sqlite3=require('sqlite3').verbose();
+const app=express(),PORTA=process.env.PORT||3000,SENHA_ADMIN=process.env.ADMIN_PASSWORD||'1234';
+const D=path.join(__dirname,'dados'),P=path.join(__dirname,'pedidos'),CONT=path.join(D,'contador.json');
+fs.mkdirSync(D,{recursive:true});fs.mkdirSync(P,{recursive:true});
+const db=new sqlite3.Database(path.join(D,'fototimer.db'));
+const DIAS=['Domingo','Segunda','Terça','Quarta','Quinta','Sexta','Sábado'];
 
-const PASTA_DADOS = path.join(__dirname, 'dados');
-const PASTA_PEDIDOS = path.join(__dirname, 'pedidos');
-const ARQUIVO_CONTADOR = path.join(PASTA_DADOS, 'contador.json');
-const ARQUIVO_STATUS = path.join(PASTA_DADOS, 'status.json');
-
-fs.mkdirSync(PASTA_DADOS, { recursive: true });
-fs.mkdirSync(PASTA_PEDIDOS, { recursive: true });
-
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-app.use('/pedidos', express.static(PASTA_PEDIDOS));
-
-app.use(session({
-  secret: 'fototimer-online-pro',
-  resave: false,
-  saveUninitialized: false
-}));
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 100 * 1024 * 1024 }
+db.serialize(()=>{
+db.run(`CREATE TABLE IF NOT EXISTS clientes(id INTEGER PRIMARY KEY AUTOINCREMENT,nome TEXT,cpf TEXT,telefone TEXT,whatsapp TEXT,cep TEXT,endereco TEXT,numero TEXT,bairro TEXT,cidade TEXT,estado TEXT,email TEXT UNIQUE,senha_hash TEXT,criado_em TEXT DEFAULT CURRENT_TIMESTAMP)`);
+db.run(`CREATE TABLE IF NOT EXISTS pedidos(id INTEGER PRIMARY KEY AUTOINCREMENT,numero TEXT,cliente_id INTEGER,cliente_nome TEXT,telefone TEXT,data_pasta TEXT,pasta_nome TEXT,total_fotos INTEGER,total_copias INTEGER,valor_total REAL DEFAULT 0,status TEXT DEFAULT 'Recebido',pagamento_status TEXT DEFAULT 'Pendente',pagamento_forma TEXT DEFAULT '',criado_em TEXT DEFAULT CURRENT_TIMESTAMP)`);
+db.run(`CREATE TABLE IF NOT EXISTS precos(id INTEGER PRIMARY KEY AUTOINCREMENT,tamanho TEXT NOT NULL,ativo INTEGER DEFAULT 1)`);
+db.run(`CREATE TABLE IF NOT EXISTS faixas_preco(id INTEGER PRIMARY KEY AUTOINCREMENT,preco_id INTEGER NOT NULL,quantidade_min INTEGER DEFAULT 1,valor_unitario REAL DEFAULT 0)`);
+db.run(`CREATE TABLE IF NOT EXISTS promocoes(id INTEGER PRIMARY KEY AUTOINCREMENT,preco_id INTEGER NOT NULL,dia_semana INTEGER NOT NULL,quantidade_min INTEGER DEFAULT 1,valor_unitario REAL DEFAULT 0,ativo INTEGER DEFAULT 1)`,()=>{db.all("PRAGMA table_info(promocoes)",[],(e,cols)=>{if(!e&&!cols.some(c=>c.name==='quantidade_min'))db.run("ALTER TABLE promocoes ADD COLUMN quantidade_min INTEGER DEFAULT 1")})});
+db.all("PRAGMA table_info(pedidos)",[],(e,cols)=>{if(!e){if(!cols.some(c=>c.name==='pagamento_status'))db.run("ALTER TABLE pedidos ADD COLUMN pagamento_status TEXT DEFAULT 'Pendente'");if(!cols.some(c=>c.name==='pagamento_forma'))db.run("ALTER TABLE pedidos ADD COLUMN pagamento_forma TEXT DEFAULT ''")}});
+db.get('SELECT COUNT(*) total FROM precos',[],(e,r)=>{if(!e&&r.total===0)[['10x15',2],['13x18',4],['15x21',6],['20x30',12],['30x40',25],['40x60',45]].forEach(x=>db.run('INSERT INTO precos(tamanho,ativo) VALUES(?,1)',[x[0]],function(){db.run('INSERT INTO faixas_preco(preco_id,quantidade_min,valor_unitario) VALUES(?,?,?)',[this.lastID,1,x[1]])}))});
 });
 
-function limparTexto(texto, padrao = '') {
-  return (texto || padrao).replace(/[<>:"/\\|?*]/g, '').trim();
-}
+app.use(express.urlencoded({extended:true}));app.use(express.json());app.use('/pedidos',express.static(P));app.use(session({secret:'fototimer-v5',resave:false,saveUninitialized:false}));
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:100*1024*1024}});
+const q=(s,p=[])=>new Promise((ok,fail)=>db.all(s,p,(e,r)=>e?fail(e):ok(r)));
+const get=(s,p=[])=>new Promise((ok,fail)=>db.get(s,p,(e,r)=>e?fail(e):ok(r)));
+const run=(s,p=[])=>new Promise((ok,fail)=>db.run(s,p,function(e){e?fail(e):ok(this)}));
+const limpar=(t,p='')=>(t||p).replace(/[<>:"/\\|?*]/g,'').trim();
+const moeda=v=>Number(v||0).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});
+const tel=t=>(t||'').replace(/\D/g,'');
+const zap=(t,m)=>{let n=tel(t);if(n.length===10||n.length===11)n='55'+n;return'https://wa.me/'+n+'?text='+encodeURIComponent(m)};
+function hoje(){let d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
+function mesAtual(){let d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')}
+function num(){let c={ultimoPedido:0};if(fs.existsSync(CONT))c=JSON.parse(fs.readFileSync(CONT));c.ultimoPedido++;fs.writeFileSync(CONT,JSON.stringify(c,null,2));return String(c.ultimoPedido).padStart(5,'0')}
+async function cliente(req){if(!req.session.clienteId)return null;return(await q('SELECT * FROM clientes WHERE id=?',[req.session.clienteId]))[0]||null}
+function adm(req,res,n){if(req.session.admin)return n();res.redirect('/admin/login')}
+function cli(req,res,n){if(req.session.clienteId)return n();res.redirect('/cliente/login')}
+function apagarPastaSegura(pasta){if(!pasta||!pasta.startsWith(P))throw new Error('Pasta inválida');if(fs.existsSync(pasta))fs.rmSync(pasta,{recursive:true,force:true})}
+async function calc(t,qt){let p=await get('SELECT * FROM precos WHERE tamanho=? AND ativo=1',[t]);if(!p)return{unitario:0,total:0,origem:'Sem preço'};let d=new Date().getDay();let pr=await get('SELECT * FROM promocoes WHERE preco_id=? AND dia_semana=? AND ativo=1 AND quantidade_min<=? ORDER BY quantidade_min DESC LIMIT 1',[p.id,d,qt]);if(pr)return{unitario:+pr.valor_unitario,total:+pr.valor_unitario*qt,origem:'Promo '+DIAS[d]};let f=await get('SELECT * FROM faixas_preco WHERE preco_id=? AND quantidade_min<=? ORDER BY quantidade_min DESC LIMIT 1',[p.id,qt]);let u=f?+f.valor_unitario:0;return{unitario:u,total:u*qt,origem:f?'Tabela':'Sem preço'}}
 
-function dataHojePasta() {
-  const hoje = new Date();
-  const ano = hoje.getFullYear();
-  const mes = String(hoje.getMonth() + 1).padStart(2, '0');
-  const dia = String(hoje.getDate()).padStart(2, '0');
-  return ano + '-' + mes + '-' + dia;
-}
+function html(t,c){return`<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>${t}</title><style>
+:root{--bg:#0f172a;--panel:#1e293b;--panel2:#111827;--txt:#fff;--muted:#cbd5e1;--blue:#2563eb;--green:#16a34a;--orange:#f59e0b;--red:#dc2626;--gray:#374151}
+body{font-family:Arial;background:var(--bg);color:var(--txt);margin:0}.layout{display:flex;min-height:100vh}.sidebar{width:230px;background:#020617;padding:18px;position:sticky;top:0;height:100vh;box-sizing:border-box}.sidebar h2{font-size:20px}.sidebar a{display:block;color:white;text-decoration:none;padding:12px;border-radius:10px;margin:6px 0;background:#111827}.sidebar a:hover{background:#334155}.main{flex:1;padding:22px;max-width:1250px}.top{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}.card{background:var(--panel);padding:18px;border-radius:18px;margin-bottom:16px;box-shadow:0 6px 18px rgba(0,0,0,.2)}.mini{padding:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:15px}.foto{background:#111827;padding:10px;border-radius:12px}.foto img{width:100%;height:135px;object-fit:cover;border-radius:10px}.stat{font-size:26px;font-weight:bold}input,select,button{width:100%;padding:11px;margin:5px 0 10px;border-radius:10px;border:0;box-sizing:border-box}.btn,button{font-weight:bold;text-decoration:none;cursor:pointer}.btn{padding:8px 11px;border-radius:10px;margin:3px;display:inline-block;color:white}.blue{background:var(--blue);color:white}.green{background:var(--green);color:white}.orange{background:var(--orange);color:white}.red{background:var(--red);color:white}.gray{background:var(--gray);color:white}.whats{background:#22c55e;color:white}.status{padding:5px 9px;border-radius:999px;background:#334155;display:inline-block}.pago{background:#166534}.pendente{background:#92400e}.resumo{background:#0f172a;padding:14px;border-radius:12px;margin:12px 0}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #334155;padding:7px;text-align:left}.small{width:auto;padding:7px 10px;margin:2px}.inline{display:flex;gap:6px;flex-wrap:wrap}details{background:#111827;border-radius:14px;padding:12px;margin:10px 0}summary{cursor:pointer;font-size:18px;font-weight:bold;padding:6px}.muted{color:var(--muted);font-size:13px}a{color:#93c5fd}@media(max-width:850px){.layout{display:block}.sidebar{width:auto;height:auto;position:relative}.sidebar a{display:inline-block}.main{padding:14px}}
+</style></head><body><div class=layout><div class=sidebar><h2>📷 FotoTimer</h2><a href="/admin">📦 Admin</a><a href="/admin/clientes">👤 Clientes</a><a href="/admin/precos">💰 Preços</a><a href="/">📤 Envio</a><a href="/precos">💰 Preços cliente</a><a href="/admin/logout">🚪 Sair</a></div><main class=main>${c}</main></div></body></html>`}
 
-function gerarNumeroPedido() {
-  let contador = { ultimoPedido: 0 };
+function etiqueta(pasta,ped,nome,fone,it,tf,tc,val,pag){fs.writeFileSync(path.join(pasta,'etiqueta.html'),`<html><head><style>@page{size:10cm 5cm;margin:0}.etiqueta{font-family:Arial;width:10cm;height:5cm;box-sizing:border-box;padding:.35cm;border:1px solid #000;font-size:12px}.linha{display:flex;justify-content:space-between;border-bottom:1px dotted #777}@media print{button{display:none}}</style></head><body><div class=etiqueta><h2>Pedido ${ped}</h2><p><b>${nome}</b> ${fone}</p><p>${tf} fotos / ${tc} cópias</p><p><b>${moeda(val)}</b> - ${pag}</p>${it}<button onclick="print()">Imprimir</button></div></body></html>`)}
+async function form(c){let ps=await q('SELECT * FROM precos WHERE ativo=1 ORDER BY tamanho'),opts=ps.map(p=>`<option value="${p.tamanho}">${p.tamanho}</option>`).join('')+'<option value="outro">Outro</option>';return`<div class=card><h1>Enviar Fotos</h1><p><a class="btn orange" href="/precos">💰 Ver tabela de preços</a></p>${c?`<p>Logado: <b>${c.nome}</b> <a href="/cliente/sair">Sair</a></p>`:`<p><a href="/cliente/login">Já tenho cadastro</a> | <a href="/cliente/cadastro">Criar cadastro</a></p>`}<form id=formulario><label>Nome</label><input id=nome value="${c?c.nome:''}" required><label>Telefone/WhatsApp</label><input id=telefone value="${c?(c.whatsapp||c.telefone||''):''}"><label>Fotos</label><input type=file id=fotos multiple accept="image/*" required><button class=orange type=button onclick="aplicar()">Aplicar primeira para todas</button><div id=listaFotos class=grade></div><div id=resumoPedido class=resumo><b>Resumo:</b><p>Nenhuma foto.</p></div><button class=green>Enviar e calcular valor</button></form></div><script>const OPC='${opts.replace(/'/g,"\\'")}';let arquivos=[];fotos.onchange=()=>{arquivos=Array.from(fotos.files);renderizar()};function renderizar(){listaFotos.innerHTML='';arquivos.forEach((a,i)=>{let u=URL.createObjectURL(a),d=document.createElement('div');d.className='foto';d.innerHTML='<img src="'+u+'"><p>'+a.name+'</p><button class=red type=button onclick="excluir('+i+')">Excluir</button><label>Tamanho</label><select id=tamanho_'+i+'>'+OPC+'</select><input id=outro_'+i+' placeholder="Outro tamanho"><label>Quantidade</label><input type=number id=quantidade_'+i+' value=1 min=1><label>Acabamento</label><select id=acabamento_'+i+'><option>Brilho</option><option>Fosco</option></select><label>Borda</label><select id=borda_'+i+'><option value=SemBorda>Sem borda</option><option value=ComBorda>Com borda</option></select>';listaFotos.appendChild(d);['tamanho_','outro_','quantidade_','acabamento_','borda_'].forEach(p=>{document.getElementById(p+i).onchange=resumo;document.getElementById(p+i).oninput=resumo})});resumo()}function excluir(i){arquivos.splice(i,1);renderizar()}function resumo(){let r={},tf=0,tc=0;arquivos.forEach((a,i)=>{let t=document.getElementById('tamanho_'+i).value;if(t==='outro')t=document.getElementById('outro_'+i).value||'Outro';let q=parseInt(document.getElementById('quantidade_'+i).value||1);if(!q||q<1)q=1;let k=t+' '+document.getElementById('acabamento_'+i).value+' '+document.getElementById('borda_'+i).value;if(!r[k])r[k]={f:0,c:0};r[k].f++;r[k].c+=q;tf++;tc+=q});if(!arquivos.length){resumoPedido.innerHTML='<b>Resumo:</b><p>Nenhuma foto.</p>';return}let h='<b>Resumo:</b><br><br>';for(const k in r)h+=k+': '+r[k].f+' foto(s) / '+r[k].c+' cópia(s)<br>';h+='<br><b>Total:</b> '+tf+' foto(s) / '+tc+' cópia(s)';resumoPedido.innerHTML=h}function aplicar(){if(!arquivos.length)return alert('Selecione fotos.');['tamanho_','outro_','quantidade_','acabamento_','borda_'].forEach(p=>{let v=document.getElementById(p+'0').value;arquivos.forEach((a,i)=>document.getElementById(p+i).value=v)});resumo()}formulario.onsubmit=async e=>{e.preventDefault();if(!arquivos.length)return alert('Selecione fotos.');let fd=new FormData();fd.append('nome',nome.value);fd.append('telefone',telefone.value);arquivos.forEach((a,i)=>{fd.append('fotos',a);['tamanho_','outro_','quantidade_','acabamento_','borda_'].forEach(p=>fd.append(p+i,document.getElementById(p+i).value))});let resp=await fetch('/upload',{method:'POST',body:fd});document.open();document.write(await resp.text());document.close()}</script>`}
 
-  if (fs.existsSync(ARQUIVO_CONTADOR)) {
-    contador = JSON.parse(fs.readFileSync(ARQUIVO_CONTADOR));
-  }
+app.get('/',async(req,res)=>res.send(html('Enviar',await form(await cliente(req)))));
+app.post('/upload',upload.array('fotos'),async(req,res)=>{let c=await cliente(req),nome=limpar(req.body.nome,c?c.nome:'SemNome'),fone=limpar(req.body.telefone,c?(c.whatsapp||c.telefone||''):''),ped=num(),data=hoje(),pastaNome=nome+' - '+fone+' - Pedido '+ped,pasta=path.join(P,data,pastaNome);fs.mkdirSync(pasta,{recursive:true});let resumo='Pedido: '+ped+'\\nCliente: '+nome+'\\nTelefone: '+fone+'\\nPagamento: Pendente\\n-----------------------------------\\n',tf=0,tc=0,val=0,agr={},et='';for(let i=0;i<req.files.length;i++){let file=req.files[i],t=limpar(req.body['tamanho_'+i]||'10x15');if(t==='outro')t=limpar(req.body['outro_'+i]||'OutroTamanho');let qt=parseInt(req.body['quantidade_'+i]||1);if(!qt||qt<1)qt=1;let ac=limpar(req.body['acabamento_'+i],'Brilho'),bo=limpar(req.body['borda_'+i],'SemBorda'),ca=await calc(t,qt);val+=ca.total;let dir=path.join(pasta,t,ac,bo);fs.mkdirSync(dir,{recursive:true});let ext=path.extname(file.originalname),base=path.basename(file.originalname,ext).replace(/[<>:"/\\|?*]/g,''),arq='QTD-'+qt+'_'+t+'_'+ac+'_'+bo+'_'+base+ext;fs.writeFileSync(path.join(dir,arq),file.buffer);tf++;tc+=qt;let k=t+' '+ac+' '+bo;if(!agr[k])agr[k]={f:0,c:0,v:0};agr[k].f++;agr[k].c+=qt;agr[k].v+=ca.total;resumo+=arq+'\\nQuantidade: '+qt+'\\nUnitário: '+moeda(ca.unitario)+' ('+ca.origem+')\\nSubtotal: '+moeda(ca.total)+'\\n-----------------------------------\\n'}for(const k in agr){resumo+=k+': '+agr[k].c+' cópias / '+moeda(agr[k].v)+'\\n';et+='<div class=linha><span>'+k+'</span><span>'+agr[k].c+'x</span></div>'}resumo+='TOTAL: '+moeda(val)+'\\n';fs.writeFileSync(path.join(pasta,'pedido.txt'),resumo);etiqueta(pasta,ped,nome,fone,et,tf,tc,val,'Pendente');await run('INSERT INTO pedidos(numero,cliente_id,cliente_nome,telefone,data_pasta,pasta_nome,total_fotos,total_copias,valor_total,status,pagamento_status,pagamento_forma) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',[ped,c?c.id:null,nome,fone,data,pastaNome,tf,tc,val,'Recebido','Pendente','']);let msg='Olá '+nome+', pedido '+ped+' recebido. Valor: '+moeda(val)+'. Pagamento pendente.';res.send(html('Recebido',`<div class=card style="text-align:center"><h1>✅ Pedido recebido</h1><h2>Pedido ${ped}</h2><p>${tf} foto(s) / ${tc} cópia(s)</p><h2>${moeda(val)}</h2><p>Pagamento: Pendente</p><a class="btn whats" target=_blank href="${zap(fone,msg)}">Enviar no WhatsApp</a><a class="btn blue" href="/">Novo pedido</a></div>`))});
 
-  contador.ultimoPedido += 1;
+app.get('/cliente/cadastro',(req,res)=>res.send(html('Cadastro',`<div class=card><h1>Cadastro</h1><form method=post action="/cliente/cadastro"><label>Nome</label><input name=nome required><label>CPF</label><input name=cpf><label>Telefone</label><input name=telefone><label>WhatsApp</label><input name=whatsapp><label>CEP</label><input name=cep><label>Endereço</label><input name=endereco><label>Número</label><input name=numero><label>Bairro</label><input name=bairro><label>Cidade</label><input name=cidade><label>Estado</label><input name=estado><label>Email</label><input type=email name=email required><label>Senha</label><input type=password name=senha required><button class=green>Cadastrar</button></form></div>`)));
+app.post('/cliente/cadastro',async(req,res)=>{try{let sh=bcrypt.hashSync(req.body.senha,10),r=await run('INSERT INTO clientes(nome,cpf,telefone,whatsapp,cep,endereco,numero,bairro,cidade,estado,email,senha_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',[req.body.nome,req.body.cpf,req.body.telefone,req.body.whatsapp,req.body.cep,req.body.endereco,req.body.numero,req.body.bairro,req.body.cidade,req.body.estado,req.body.email.toLowerCase(),sh]);req.session.clienteId=r.lastID;res.redirect('/cliente')}catch(e){res.send(html('Erro','<div class=card>Email já cadastrado</div>'))}});
+app.get('/cliente/login',(req,res)=>res.send(html('Login',`<div class=card style="max-width:450px;margin:auto"><h1>Login</h1><form method=post action="/cliente/login"><label>Email</label><input type=email name=email required><label>Senha</label><input type=password name=senha required><button class=green>Entrar</button></form><a href="/cliente/cadastro">Criar cadastro</a></div>`)));
+app.post('/cliente/login',async(req,res)=>{let c=(await q('SELECT * FROM clientes WHERE email=?',[req.body.email.toLowerCase()]))[0];if(c&&bcrypt.compareSync(req.body.senha,c.senha_hash)){req.session.clienteId=c.id;return res.redirect('/cliente')}res.send(html('Erro','<div class=card>Login ou senha incorretos</div>'))});
+app.get('/cliente/sair',(req,res)=>{delete req.session.clienteId;res.redirect('/')});
+app.get('/cliente',cli,async(req,res)=>{let c=await cliente(req),ped=await q('SELECT * FROM pedidos WHERE cliente_id=? ORDER BY id DESC',[c.id]);let h=`<div class=card><h1>Minha conta</h1><p>${c.nome}</p><a class="btn blue" href="/">Enviar novo pedido</a><a class="btn gray" href="/cliente/sair">Sair</a></div>`;ped.forEach(p=>h+=`<details><summary>Pedido ${p.numero} — ${moeda(p.valor_total)} — ${p.pagamento_status||'Pendente'}</summary><div class=card><p>Status: ${p.status}</p><p>Pagamento: ${p.pagamento_status||'Pendente'}</p><p>${p.total_copias} cópia(s)</p></div></details>`);res.send(html('Cliente',h))});
 
-  fs.writeFileSync(
-    ARQUIVO_CONTADOR,
-    JSON.stringify(contador, null, 2)
-  );
 
-  return String(contador.ultimoPedido).padStart(5, '0');
-}
-
-function carregarStatus() {
-  if (fs.existsSync(ARQUIVO_STATUS)) {
-    return JSON.parse(fs.readFileSync(ARQUIVO_STATUS));
-  }
-
-  return {};
-}
-
-function salvarStatus(status) {
-  fs.writeFileSync(ARQUIVO_STATUS, JSON.stringify(status, null, 2));
-}
-
-function setStatusPedido(pedido, novoStatus) {
-  const status = carregarStatus();
-  status[pedido] = novoStatus;
-  salvarStatus(status);
-}
-
-function getStatusPedido(pedido) {
-  const status = carregarStatus();
-  return status[pedido] || 'Recebido';
-}
-
-function precisaLogin(req, res, next) {
-  if (req.session && req.session.admin) {
-    return next();
-  }
-
-  res.redirect('/login');
-}
-
-function layout(titulo, conteudo) {
-  return `
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>${titulo}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-
-<style>
-body{font-family:Arial;background:#111827;color:white;margin:0;padding:0}
-.header{background:#020617;padding:18px 24px;display:flex;justify-content:space-between;align-items:center}
-.header h1{margin:0;font-size:22px}
-.container{padding:24px;max-width:1180px;margin:auto}
-.card{background:#1f2937;padding:22px;border-radius:18px;margin-bottom:18px}
-input,select,button{width:100%;padding:13px;margin-top:8px;margin-bottom:16px;border-radius:10px;border:0;box-sizing:border-box}
-button,.btn{cursor:pointer;font-weight:bold;text-decoration:none;display:inline-block;text-align:center}
-.btn{padding:10px 14px;border-radius:10px;margin:4px}
-.green{background:#16a34a;color:white}
-.blue{background:#2563eb;color:white}
-.orange{background:#f59e0b;color:white}
-.red{background:#dc2626;color:white}
-.gray{background:#374151;color:white}
-label{font-weight:bold}
-.grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:15px;margin-top:20px}
-.foto{background:#111827;padding:10px;border-radius:12px}
-.foto img{width:100%;height:135px;object-fit:cover;border-radius:10px}
-.pequeno{font-size:13px;color:#d1d5db;word-break:break-all}
-.resumo{background:#0f172a;padding:15px;border-radius:12px;margin-top:20px;font-size:16px;line-height:1.6}
-.status{padding:6px 10px;border-radius:999px;background:#334155;display:inline-block}
-a{color:#93c5fd}
-</style>
-</head>
-
-<body>
-
-<div class="header">
-<h1>📷 FotoTimer Online Pro</h1>
-<div>
-<a href="/" class="btn blue">Cliente</a>
-<a href="/admin" class="btn gray">Painel</a>
-</div>
-</div>
-
-<div class="container">
-${conteudo}
-</div>
-
-</body>
-</html>
-`;
-}
-
-function criarEtiquetaHTML(pastaPedido, pedido, nome, telefone, resumoItens, totalFotos, totalCopias) {
-  const etiqueta = `
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Etiqueta Pedido ${pedido}</title>
-
-<style>
-@page { size: 10cm 5cm; margin: 0; }
-body { margin: 0; font-family: Arial; }
-.etiqueta {
-  width: 10cm;
-  height: 5cm;
-  box-sizing: border-box;
-  padding: 0.35cm;
-  border: 1px solid #000;
-  font-size: 12px;
-}
-h2 { margin: 0 0 5px 0; font-size: 18px; }
-p { margin: 2px 0; }
-.tabela { margin-top: 5px; font-size: 11px; }
-.linha {
-  display: flex;
-  justify-content: space-between;
-  border-bottom: 1px dotted #777;
-}
-.botao { margin-top: 10px; }
-@media print { .botao { display: none; } }
-</style>
-</head>
-
-<body>
-<div class="etiqueta">
-<h2>Pedido ${pedido}</h2>
-<p><b>Cliente:</b> ${nome}</p>
-<p><b>Telefone:</b> ${telefone}</p>
-<p><b>Data:</b> ${new Date().toLocaleString('pt-BR')}</p>
-<p><b>Fotos:</b> ${totalFotos} arquivos / ${totalCopias} cópias</p>
-<div class="tabela">${resumoItens}</div>
-<button class="botao" onclick="window.print()">Imprimir etiqueta</button>
-</div>
-</body>
-</html>
-`;
-
-  fs.writeFileSync(path.join(pastaPedido, 'etiqueta.html'), etiqueta);
-}
-
-app.get('/', (req, res) => {
-  res.send(layout('Enviar Fotos', `
-<div class="card">
-<h1>Enviar Fotos</h1>
-
-<form id="formulario">
-
-<label>Nome do cliente</label>
-<input type="text" id="nome" required>
-
-<label>Telefone / WhatsApp</label>
-<input type="text" id="telefone">
-
-<p><b>Número do pedido:</b> gerado automaticamente pelo sistema</p>
-
-<label>Selecionar fotos</label>
-<input type="file" id="fotos" multiple accept="image/*" required>
-
-<button class="orange" type="button" onclick="aplicarPrimeiraParaTodas()">
-Aplicar configuração da primeira foto para todas
-</button>
-
-<div id="listaFotos" class="grade"></div>
-
-<div id="resumoPedido" class="resumo">
-<b>Resumo do pedido:</b>
-<p>Nenhuma foto selecionada.</p>
-</div>
-
-<button class="green" type="submit">
-Enviar Fotos
-</button>
-
-</form>
-</div>
-
-<script>
-const inputFotos = document.getElementById('fotos');
-const listaFotos = document.getElementById('listaFotos');
-const formulario = document.getElementById('formulario');
-
-let arquivos = [];
-
-inputFotos.addEventListener('change', function() {
-  arquivos = Array.from(inputFotos.files);
-  renderizarFotos();
-});
-
-function renderizarFotos() {
-  listaFotos.innerHTML = '';
-
-  arquivos.forEach(function(arquivo, index) {
-    const url = URL.createObjectURL(arquivo);
-    const div = document.createElement('div');
-    div.className = 'foto';
-
-    div.innerHTML =
-      '<img src="' + url + '">' +
-      '<p class="pequeno">' + arquivo.name + '</p>' +
-
-      '<button class="red" type="button" onclick="excluirFoto(' + index + ')">🗑 Excluir foto</button>' +
-
-      '<label>Tamanho</label>' +
-      '<select id="tamanho_' + index + '">' +
-      '<option value="10x15" selected>10x15</option>' +
-      '<option value="13x18">13x18</option>' +
-      '<option value="15x21">15x21</option>' +
-      '<option value="20x30">20x30</option>' +
-      '<option value="30x40">30x40</option>' +
-      '<option value="40x60">40x60</option>' +
-      '<option value="outro">Outro</option>' +
-      '</select>' +
-
-      '<input type="text" id="outro_' + index + '" placeholder="Outro tamanho. Ex: 18x24">' +
-
-      '<label>Quantidade</label>' +
-      '<input type="number" id="quantidade_' + index + '" value="1" min="1">' +
-
-      '<label>Acabamento</label>' +
-      '<select id="acabamento_' + index + '">' +
-      '<option value="Brilho" selected>Brilho</option>' +
-      '<option value="Fosco">Fosco</option>' +
-      '</select>' +
-
-      '<label>Borda</label>' +
-      '<select id="borda_' + index + '">' +
-      '<option value="SemBorda" selected>Sem borda</option>' +
-      '<option value="ComBorda">Com borda</option>' +
-      '</select>';
-
-    listaFotos.appendChild(div);
-
-    document.getElementById('tamanho_' + index).addEventListener('change', atualizarResumo);
-    document.getElementById('outro_' + index).addEventListener('input', atualizarResumo);
-    document.getElementById('quantidade_' + index).addEventListener('input', atualizarResumo);
-    document.getElementById('acabamento_' + index).addEventListener('change', atualizarResumo);
-    document.getElementById('borda_' + index).addEventListener('change', atualizarResumo);
-  });
-
-  atualizarResumo();
-}
-
-function excluirFoto(index) {
-  arquivos.splice(index, 1);
-  renderizarFotos();
-}
-
-function atualizarResumo() {
-  const resumo = {};
-  let totalFotos = 0;
-  let totalCopias = 0;
-
-  arquivos.forEach(function(arquivo, index) {
-    let tamanho = document.getElementById('tamanho_' + index).value;
-
-    if (tamanho === 'outro') {
-      tamanho = document.getElementById('outro_' + index).value || 'Outro';
+app.get('/precos', async (req,res)=>{
+  let precos = await q('SELECT * FROM precos WHERE ativo=1 ORDER BY tamanho');
+  let h = `<div class=top><h1>💰 Tabela de preços</h1><a class="btn blue" href="/">Enviar fotos</a></div>
+  <div class=card><p>Confira nossos tamanhos, pacotes e promoções da semana. O valor final também é calculado automaticamente ao enviar as fotos.</p></div>
+  <div class=grid>`;
+  for(const p of precos){
+    let faixas = await q('SELECT * FROM faixas_preco WHERE preco_id=? ORDER BY quantidade_min',[p.id]);
+    let promos = await q('SELECT * FROM promocoes WHERE preco_id=? AND ativo=1 ORDER BY dia_semana, quantidade_min',[p.id]);
+    h += `<div class=card><h2>${p.tamanho}</h2><h3>Pacotes</h3>`;
+    if(faixas.length){
+      h += `<table><tr><th>A partir de</th><th>Valor unitário</th></tr>`;
+      faixas.forEach(f=> h += `<tr><td>${f.quantidade_min} foto(s)</td><td>${moeda(f.valor_unitario)}</td></tr>`);
+      h += `</table>`;
+    } else {
+      h += `<p class=muted>Preço não cadastrado.</p>`;
     }
-
-    const acabamento = document.getElementById('acabamento_' + index).value;
-    const borda = document.getElementById('borda_' + index).value;
-
-    let quantidade = parseInt(document.getElementById('quantidade_' + index).value || '1', 10);
-
-    if (isNaN(quantidade) || quantidade < 1) {
-      quantidade = 1;
+    if(promos.length){
+      h += `<h3>Promoções da semana</h3><table><tr><th>Dia</th><th>A partir de</th><th>Valor</th></tr>`;
+      promos.forEach(pr=> h += `<tr><td>${DIAS[pr.dia_semana]}</td><td>${pr.quantidade_min} foto(s)</td><td>${moeda(pr.valor_unitario)}</td></tr>`);
+      h += `</table>`;
     }
-
-    const chave = tamanho + ' ' + acabamento + ' ' + borda;
-
-    if (!resumo[chave]) {
-      resumo[chave] = { fotos: 0, copias: 0 };
-    }
-
-    resumo[chave].fotos += 1;
-    resumo[chave].copias += quantidade;
-
-    totalFotos += 1;
-    totalCopias += quantidade;
-  });
-
-  if (arquivos.length === 0) {
-    document.getElementById('resumoPedido').innerHTML =
-      '<b>Resumo do pedido:</b><p>Nenhuma foto selecionada.</p>';
-    return;
+    h += `</div>`;
   }
-
-  let html = '<b>Resumo do pedido:</b><br><br>';
-
-  for (const chave in resumo) {
-    html += chave + ': ' +
-      resumo[chave].fotos + ' foto(s) / ' +
-      resumo[chave].copias + ' cópia(s)<br>';
+  h += `</div>
+  <div class=card><h2>🧮 Simulador de valor</h2>
+  <label>Tamanho</label><select id=simTamanho>${precos.map(p=>`<option value="${p.tamanho}">${p.tamanho}</option>`).join('')}</select>
+  <label>Quantidade</label><input id=simQtd type=number value=1 min=1>
+  <button class=green onclick="simular()">Simular</button>
+  <div id=simResultado class=resumo>Escolha tamanho e quantidade.</div>
+  </div>
+  <script>
+  async function simular(){
+    const tamanho=document.getElementById('simTamanho').value;
+    const quantidade=document.getElementById('simQtd').value;
+    const r=await fetch('/api/simular-preco?tamanho='+encodeURIComponent(tamanho)+'&quantidade='+encodeURIComponent(quantidade));
+    const j=await r.json();
+    document.getElementById('simResultado').innerHTML='<b>Total:</b> '+j.total_formatado+'<br><b>Valor unitário:</b> '+j.unitario_formatado+'<br><b>Regra:</b> '+j.origem;
   }
+  </script>`;
+  res.send(html('Tabela de preços',h));
+});
 
-  html += '<br><b>Total:</b> ' +
-    totalFotos + ' foto(s) / ' +
-    totalCopias + ' cópia(s)';
-
-  document.getElementById('resumoPedido').innerHTML = html;
-}
-
-function aplicarPrimeiraParaTodas() {
-  if (arquivos.length === 0) {
-    alert('Selecione as fotos primeiro.');
-    return;
-  }
-
-  const tamanho = document.getElementById('tamanho_0').value;
-  const outro = document.getElementById('outro_0').value;
-  const quantidade = document.getElementById('quantidade_0').value;
-  const acabamento = document.getElementById('acabamento_0').value;
-  const borda = document.getElementById('borda_0').value;
-
-  arquivos.forEach(function(arquivo, index) {
-    document.getElementById('tamanho_' + index).value = tamanho;
-    document.getElementById('outro_' + index).value = outro;
-    document.getElementById('quantidade_' + index).value = quantidade;
-    document.getElementById('acabamento_' + index).value = acabamento;
-    document.getElementById('borda_' + index).value = borda;
+app.get('/api/simular-preco', async (req,res)=>{
+  const tamanho = req.query.tamanho || '10x15';
+  let quantidade = parseInt(req.query.quantidade || '1');
+  if(!quantidade || quantidade < 1) quantidade = 1;
+  const c = await calc(tamanho, quantidade);
+  res.json({
+    tamanho,
+    quantidade,
+    unitario: c.unitario,
+    total: c.total,
+    origem: c.origem,
+    unitario_formatado: moeda(c.unitario),
+    total_formatado: moeda(c.total)
   });
-
-  atualizarResumo();
-  alert('Configuração aplicada para todas as fotos.');
-}
-
-formulario.addEventListener('submit', async function(e) {
-  e.preventDefault();
-
-  if (arquivos.length === 0) {
-    alert('Selecione pelo menos uma foto.');
-    return;
-  }
-
-  const dados = new FormData();
-
-  dados.append('nome', document.getElementById('nome').value);
-  dados.append('telefone', document.getElementById('telefone').value);
-
-  arquivos.forEach(function(arquivo, index) {
-    dados.append('fotos', arquivo);
-    dados.append('tamanho_' + index, document.getElementById('tamanho_' + index).value);
-    dados.append('outro_' + index, document.getElementById('outro_' + index).value);
-    dados.append('quantidade_' + index, document.getElementById('quantidade_' + index).value);
-    dados.append('acabamento_' + index, document.getElementById('acabamento_' + index).value);
-    dados.append('borda_' + index, document.getElementById('borda_' + index).value);
-  });
-
-  const resposta = await fetch('/upload', {
-    method: 'POST',
-    body: dados
-  });
-
-  const html = await resposta.text();
-
-  document.open();
-  document.write(html);
-  document.close();
-});
-</script>
-`));
 });
 
-app.post('/upload', upload.array('fotos'), (req, res) => {
-  const nome = limparTexto(req.body.nome, 'SemNome');
-  const telefone = limparTexto(req.body.telefone, '');
-  const pedido = gerarNumeroPedido();
-  const dataPasta = dataHojePasta();
 
-  const pastaPedido = path.join(
-    PASTA_PEDIDOS,
-    dataPasta,
-    nome + ' - ' + telefone + ' - Pedido ' + pedido
-  );
-
-  fs.mkdirSync(pastaPedido, { recursive: true });
-
-  let resumo = '';
-  let resumoEtiqueta = '';
-  let totalFotos = 0;
-  let totalCopias = 0;
-  const resumoAgrupado = {};
-
-  resumo += 'Pedido: ' + pedido + '\\n';
-  resumo += 'Cliente: ' + nome + '\\n';
-  resumo += 'Telefone: ' + telefone + '\\n';
-  resumo += 'Data: ' + new Date().toLocaleString('pt-BR') + '\\n';
-  resumo += 'Status: Recebido\\n';
-  resumo += '-----------------------------------\\n';
-
-  req.files.forEach((file, index) => {
-    let tamanho = req.body['tamanho_' + index] || '10x15';
-
-    if (tamanho === 'outro') {
-      tamanho = req.body['outro_' + index] || 'OutroTamanho';
-    }
-
-    tamanho = limparTexto(tamanho, '10x15');
-
-    let quantidade = parseInt(req.body['quantidade_' + index] || '1', 10);
-
-    if (isNaN(quantidade) || quantidade < 1) {
-      quantidade = 1;
-    }
-
-    const acabamento = limparTexto(req.body['acabamento_' + index], 'Brilho');
-    const borda = limparTexto(req.body['borda_' + index], 'SemBorda');
-
-    const pastaFinal = path.join(pastaPedido, tamanho, acabamento, borda);
-
-    fs.mkdirSync(pastaFinal, { recursive: true });
-
-    const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext).replace(/[<>:"/\\|?*]/g, '');
-
-    const nomeArquivo =
-      'QTD-' + quantidade + '_' + tamanho + '_' + acabamento + '_' + borda + '_' + base + ext;
-
-    fs.writeFileSync(path.join(pastaFinal, nomeArquivo), file.buffer);
-
-    totalFotos += 1;
-    totalCopias += quantidade;
-
-    const chave = tamanho + ' ' + acabamento + ' ' + borda;
-
-    if (!resumoAgrupado[chave]) {
-      resumoAgrupado[chave] = { fotos: 0, copias: 0 };
-    }
-
-    resumoAgrupado[chave].fotos += 1;
-    resumoAgrupado[chave].copias += quantidade;
-
-    resumo += nomeArquivo + '\\n';
-    resumo += 'Tamanho: ' + tamanho + '\\n';
-    resumo += 'Acabamento: ' + acabamento + '\\n';
-    resumo += 'Borda: ' + borda + '\\n';
-    resumo += 'Quantidade: ' + quantidade + '\\n';
-    resumo += '-----------------------------------\\n';
-  });
-
-  resumo += '\\nRESUMO DO PEDIDO\\n';
-  resumo += '-----------------------------------\\n';
-
-  for (const chave in resumoAgrupado) {
-    resumo += chave + ': ' +
-      resumoAgrupado[chave].fotos + ' foto(s) / ' +
-      resumoAgrupado[chave].copias + ' cópia(s)\\n';
-
-    resumoEtiqueta +=
-      '<div class="linha">' +
-      '<span>' + chave + '</span>' +
-      '<span>' + resumoAgrupado[chave].copias + 'x</span>' +
-      '</div>';
-  }
-
-  resumo += '\\nTOTAL: ' + totalFotos + ' foto(s) / ' + totalCopias + ' cópia(s)\\n';
-
-  fs.writeFileSync(path.join(pastaPedido, 'pedido.txt'), resumo);
-
-  criarEtiquetaHTML(
-    pastaPedido,
-    pedido,
-    nome,
-    telefone,
-    resumoEtiqueta,
-    totalFotos,
-    totalCopias
-  );
-
-  setStatusPedido(pedido, 'Recebido');
-
-  res.send(layout('Pedido recebido', `
-<div class="card" style="text-align:center">
-<h1>✅ Fotos enviadas com sucesso</h1>
-<h2>Pedido ${pedido}</h2>
-<p>Total: ${totalFotos} foto(s) / ${totalCopias} cópia(s)</p>
-<p>Seu pedido foi recebido.</p>
-<a class="btn blue" href="/">Novo pedido</a>
-</div>
-`));
-});
-
-app.get('/login', (req, res) => {
-  res.send(layout('Login Admin', `
-<div class="card" style="max-width:420px;margin:auto">
-<h1>Login Administrativo</h1>
-<form method="post" action="/login">
-<label>Senha</label>
-<input type="password" name="senha" required>
-<button class="green" type="submit">Entrar</button>
-</form>
-<p>Senha padrão: 1234</p>
-</div>
-`));
-});
-
-app.post('/login', (req, res) => {
-  if (req.body.senha === SENHA_ADMIN) {
-    req.session.admin = true;
-    return res.redirect('/admin');
-  }
-
-  res.send(layout('Erro', `
-<div class="card">
-<h1>Senha incorreta</h1>
-<a href="/login">Tentar novamente</a>
-</div>
-`));
-});
-
-app.get('/logout', (req, res) => {
-  req.session.destroy(() => res.redirect('/login'));
-});
-
-function listarPedidos() {
-  if (!fs.existsSync(PASTA_PEDIDOS)) {
-    return [];
-  }
-
-  const resultado = [];
-
-  fs.readdirSync(PASTA_PEDIDOS).forEach(data => {
-    const pastaData = path.join(PASTA_PEDIDOS, data);
-
-    if (fs.statSync(pastaData).isDirectory()) {
-      fs.readdirSync(pastaData).forEach(pedidoNome => {
-        const pastaPedido = path.join(pastaData, pedidoNome);
-
-        if (fs.statSync(pastaPedido).isDirectory()) {
-          const match = pedidoNome.match(/Pedido (\\d+)/);
-          const numero = match ? match[1] : pedidoNome;
-
-          resultado.push({
-            data,
-            pedidoNome,
-            numero,
-            caminho: pastaPedido
-          });
-        }
-      });
-    }
-  });
-
-  return resultado.reverse();
-}
-
-app.get('/admin', precisaLogin, (req, res) => {
-  const busca = (req.query.busca || '').toLowerCase();
-  const statusFiltro = req.query.status || '';
-
-  let pedidos = listarPedidos();
-
-  pedidos = pedidos.filter(item => {
-    const statusAtual = getStatusPedido(item.numero);
-    const texto = (item.pedidoNome + ' ' + item.numero + ' ' + item.data).toLowerCase();
-
-    return (!busca || texto.includes(busca)) &&
-      (!statusFiltro || statusAtual === statusFiltro);
-  });
-
-  let cards = '';
-
-  pedidos.forEach(item => {
-    const rel = path.relative(PASTA_PEDIDOS, item.caminho).replace(/\\\\/g, '/');
-    const statusAtual = getStatusPedido(item.numero);
-
-    cards += `
-<div class="card">
-<h2>${item.pedidoNome}</h2>
-<p>Data: ${item.data}</p>
-<p>Status: <span class="status">${statusAtual}</span></p>
-
-<form method="post" action="/admin/status" style="max-width:260px">
-<input type="hidden" name="pedido" value="${item.numero}">
-
-<select name="status">
-<option ${statusAtual === 'Recebido' ? 'selected' : ''}>Recebido</option>
-<option ${statusAtual === 'Em produção' ? 'selected' : ''}>Em produção</option>
-<option ${statusAtual === 'Impresso' ? 'selected' : ''}>Impresso</option>
-<option ${statusAtual === 'Entregue' ? 'selected' : ''}>Entregue</option>
-</select>
-
-<button class="orange" type="submit">
-Atualizar status
-</button>
-</form>
-
-<a class="btn blue" href="/pedidos/${rel}/pedido.txt" target="_blank">Resumo</a>
-<a class="btn orange" href="/pedidos/${rel}/etiqueta.html" target="_blank">Etiqueta</a>
-<a class="btn green" href="/admin/download/${encodeURIComponent(item.data)}/${encodeURIComponent(item.pedidoNome)}">Baixar ZIP</a>
-
-</div>
-`;
-  });
-
-  res.send(layout('Painel Administrativo', `
-<div class="card">
-<h1>📋 Painel de pedidos</h1>
-<p><a href="/logout">Sair</a></p>
-
-<form method="get" action="/admin">
-
-<label>Buscar</label>
-<input type="text" name="busca" value="${req.query.busca || ''}">
-
-<label>Status</label>
-<select name="status">
-<option value="">Todos</option>
-<option ${statusFiltro === 'Recebido' ? 'selected' : ''}>Recebido</option>
-<option ${statusFiltro === 'Em produção' ? 'selected' : ''}>Em produção</option>
-<option ${statusFiltro === 'Impresso' ? 'selected' : ''}>Impresso</option>
-<option ${statusFiltro === 'Entregue' ? 'selected' : ''}>Entregue</option>
-</select>
-
-<button class="blue" type="submit">Filtrar</button>
-
-</form>
-</div>
-
-${cards || '<div class="card"><p>Nenhum pedido encontrado.</p></div>'}
-`));
-});
-
-app.post('/admin/status', precisaLogin, (req, res) => {
-  setStatusPedido(req.body.pedido, req.body.status);
-  res.redirect('/admin');
-});
-
-app.get('/admin/download/:data/:pedidoNome', precisaLogin, (req, res) => {
-  const pastaPedido = path.join(
-    PASTA_PEDIDOS,
-    req.params.data,
-    req.params.pedidoNome
-  );
-
-  if (!fs.existsSync(pastaPedido)) {
-    return res.status(404).send('Pedido não encontrado');
-  }
-
-  res.attachment(req.params.pedidoNome + '.zip');
-
-  const archive = archiver('zip', {
-    zlib: { level: 9 }
-  });
-
-  archive.on('error', function(err) {
-    console.log(err);
-    res.status(500).send('Erro ao gerar ZIP');
-  });
-
-  archive.pipe(res);
-  archive.directory(pastaPedido, false);
-  archive.finalize();
-});
-
-app.listen(PORTA, () => {
-  console.log('FotoTimer Online Pro rodando na porta ' + PORTA);
-});
+app.get('/admin/login',(req,res)=>res.send(`<!DOCTYPE html><html><head><meta charset=utf-8><style>body{font-family:Arial;background:#111827;color:white}.card{max-width:420px;margin:80px auto;background:#1f2937;padding:25px;border-radius:18px}input,button{width:100%;padding:13px;margin:8px 0;border:0;border-radius:10px}.green{background:#16a34a;color:white;font-weight:bold}</style></head><body><div class=card><h1>FotoTimer Admin</h1><form method=post action="/admin/login"><label>Senha</label><input type=password name=senha required><button class=green>Entrar</button></form><p>Senha padrão: 1234</p></div></body></html>`));
+app.post('/admin/login',(req,res)=>{if(req.body.senha===SENHA_ADMIN){req.session.admin=true;return res.redirect('/admin')}res.send('Senha incorreta')});
+app.get('/admin/logout',(req,res)=>req.session.destroy(()=>res.redirect('/admin/login')));
+
+app.get('/admin',adm,async(req,res)=>{let ped=await q('SELECT * FROM pedidos ORDER BY id DESC'),clientes=await get('SELECT COUNT(*) total FROM clientes'),hojeData=hoje(),mes=mesAtual();let hojePedidos=await get('SELECT COUNT(*) total, SUM(valor_total) valor FROM pedidos WHERE data_pasta=?',[hojeData]);let pend=await get("SELECT COUNT(*) total FROM pedidos WHERE pagamento_status='Pendente' OR pagamento_status IS NULL");let h=`<div class=top><h1>Dashboard</h1><a class="btn orange" href="/admin/precos">Tabela de preços</a></div><div class=grid><div class="card mini"><div class=muted>Pedidos hoje</div><div class=stat>${hojePedidos.total||0}</div></div><div class="card mini"><div class=muted>Faturamento hoje</div><div class=stat>${moeda(hojePedidos.valor||0)}</div></div><div class="card mini"><div class=muted>Clientes</div><div class=stat>${clientes.total||0}</div></div><div class="card mini"><div class=muted>Pagamentos pendentes</div><div class=stat>${pend.total||0}</div></div></div><details open><summary>🧹 Limpeza do servidor</summary><div class=card><form method=post action="/admin/excluir/dia" onsubmit="return confirm('Excluir TODOS os pedidos de hoje? Baixe os ZIPs antes.')"><input type=hidden name=data value="${hojeData}"><button class=red>Excluir pedidos de hoje (${hojeData})</button></form><form method=post action="/admin/excluir/mes" onsubmit="return confirm('Excluir TODOS os pedidos deste mês? Baixe os ZIPs antes.')"><input type=hidden name=mes value="${mes}"><button class=red>Excluir pedidos deste mês (${mes})</button></form></div></details><details open><summary>📦 Pedidos</summary>`;ped.forEach(p=>{let pg=p.pagamento_status||'Pendente',pgClass=pg==='Pago'?'pago':'pendente',msg='Olá '+p.cliente_nome+', pedido '+p.numero+' recebido. Valor: '+moeda(p.valor_total)+'. Pagamento: '+pg;h+=`<details><summary>Pedido ${p.numero} — ${p.cliente_nome} — ${moeda(p.valor_total)} — <span class="${pgClass} status">${pg}</span></summary><div class=card><p><b>Telefone:</b> ${p.telefone||''}</p><p><b>Status:</b> ${p.status}</p><p><b>Total:</b> ${p.total_fotos} foto(s) / ${p.total_copias} cópia(s)</p><h3>${moeda(p.valor_total)}</h3><form method=post action="/admin/pagamento"><input type=hidden name=id value="${p.id}"><label>Pagamento</label><select name=pagamento_status><option ${pg==='Pendente'?'selected':''}>Pendente</option><option ${pg==='Pago'?'selected':''}>Pago</option><option ${pg==='Parcial'?'selected':''}>Parcial</option><option ${pg==='Cancelado'?'selected':''}>Cancelado</option></select><label>Forma</label><select name=pagamento_forma><option></option><option ${p.pagamento_forma==='PIX'?'selected':''}>PIX</option><option ${p.pagamento_forma==='Dinheiro'?'selected':''}>Dinheiro</option><option ${p.pagamento_forma==='Cartão'?'selected':''}>Cartão</option><option ${p.pagamento_forma==='Link'?'selected':''}>Link</option></select><button class=green>Salvar pagamento</button></form><div class=inline><a class="btn blue" href="/pedidos/${p.data_pasta}/${encodeURIComponent(p.pasta_nome)}/pedido.txt" target=_blank>Resumo</a><a class="btn orange" href="/pedidos/${p.data_pasta}/${encodeURIComponent(p.pasta_nome)}/etiqueta.html" target=_blank>Etiqueta</a><a class="btn green" href="/admin/download/${encodeURIComponent(p.data_pasta)}/${encodeURIComponent(p.pasta_nome)}">Baixar ZIP</a><a class="btn whats" target=_blank href="${zap(p.telefone,msg)}">WhatsApp</a></div><form method=post action="/admin/excluir/pedido" onsubmit="return confirm('Excluir este pedido do servidor? Baixe o ZIP antes.')"><input type=hidden name=id value="${p.id}"><button class=red>Excluir pedido do servidor</button></form></div></details>`});h+='</details>';res.send(html('Admin',h))});
+app.post('/admin/pagamento',adm,async(req,res)=>{await run('UPDATE pedidos SET pagamento_status=?,pagamento_forma=? WHERE id=?',[req.body.pagamento_status,req.body.pagamento_forma,req.body.id]);res.redirect('/admin')});
+
+app.get('/admin/clientes',adm,async(req,res)=>{let clientes=await q('SELECT * FROM clientes ORDER BY nome'),h='<h1>Clientes</h1>';clientes.forEach(c=>{h+=`<details><summary>${c.nome} — ${c.telefone||c.whatsapp||''}</summary><div class=card><p><b>Email:</b> ${c.email||''}</p><p><b>CPF:</b> ${c.cpf||''}</p><p><b>Endereço:</b> ${c.endereco||''}, ${c.numero||''} - ${c.bairro||''} - ${c.cidade||''}/${c.estado||''}</p><a class="btn whats" target=_blank href="${zap(c.whatsapp||c.telefone,'Olá '+c.nome+', tudo bem?')}">WhatsApp</a></div></details>`});res.send(html('Clientes',h))});
+
+app.get('/admin/precos',adm,async(req,res)=>{let precos=await q('SELECT * FROM precos ORDER BY tamanho'),h=`<h1>Tabela de preços compacta</h1><div class=card><h2>Novo tamanho</h2><form method=post action="/admin/precos/novo"><label>Tamanho</label><input name=tamanho required placeholder="Ex: 18x24"><label>Valor inicial</label><input name=valor type=number step=.01 required><button class=green>Criar tamanho</button></form></div>`;for(const p of precos){let faixas=await q('SELECT * FROM faixas_preco WHERE preco_id=? ORDER BY quantidade_min',[p.id]),promos=await q('SELECT * FROM promocoes WHERE preco_id=? ORDER BY dia_semana,quantidade_min',[p.id]);h+=`<details><summary>💰 ${p.tamanho} ${p.ativo?'':'(inativo)'}</summary><div class=card><form method=post action="/admin/precos/editar"><input type=hidden name=id value="${p.id}"><label>Tamanho</label><input name=tamanho value="${p.tamanho}"><label>Ativo</label><select name=ativo><option value=1 ${p.ativo?'selected':''}>Sim</option><option value=0 ${!p.ativo?'selected':''}>Não</option></select><button class=blue>Alterar tamanho</button></form><form method=post action="/admin/precos/excluir" onsubmit="return confirm('Excluir tamanho e todos os preços?')"><input type=hidden name=id value="${p.id}"><button class=red>Excluir tamanho</button></form><details open><summary>Pacotes / faixas</summary><table><tr><th>A partir de</th><th>Valor</th><th>Ações</th></tr>${faixas.map(f=>`<tr><td>${f.quantidade_min}</td><td>${moeda(f.valor_unitario)}</td><td><form method=post action="/admin/precos/faixa/editar"><input type=hidden name=id value="${f.id}"><input name=quantidade_min type=number value="${f.quantidade_min}"><input name=valor_unitario type=number step=.01 value="${f.valor_unitario}"><button class="blue small">Alterar</button></form><form method=post action="/admin/precos/faixa/excluir" onsubmit="return confirm('Excluir faixa?')"><input type=hidden name=id value="${f.id}"><button class="red small">Excluir</button></form></td></tr>`).join('')}</table><form method=post action="/admin/precos/faixa"><input type=hidden name=preco_id value="${p.id}"><label>A partir de quantas fotos?</label><input name=quantidade_min type=number value=1><label>Valor unitário</label><input name=valor_unitario type=number step=.01><button class=green>Criar pacote/faixa</button></form></details><details><summary>Promoções semanais com faixas</summary><table><tr><th>Dia</th><th>A partir de</th><th>Valor promo</th><th>Ativo</th><th>Ações</th></tr>${promos.map(pr=>`<tr><td>${DIAS[pr.dia_semana]}</td><td>${pr.quantidade_min}</td><td>${moeda(pr.valor_unitario)}</td><td>${pr.ativo?'Sim':'Não'}</td><td><form method=post action="/admin/precos/promocao/editar"><input type=hidden name=id value="${pr.id}"><select name=dia_semana>${DIAS.map((d,i)=>`<option value="${i}" ${i==pr.dia_semana?'selected':''}>${d}</option>`).join('')}</select><input name=quantidade_min type=number value="${pr.quantidade_min}"><input name=valor_unitario type=number step=.01 value="${pr.valor_unitario}"><select name=ativo><option value=1 ${pr.ativo?'selected':''}>Sim</option><option value=0 ${!pr.ativo?'selected':''}>Não</option></select><button class="blue small">Alterar</button></form><form method=post action="/admin/precos/promocao/excluir" onsubmit="return confirm('Excluir promoção?')"><input type=hidden name=id value="${pr.id}"><button class="red small">Excluir</button></form></td></tr>`).join('')}</table><form method=post action="/admin/precos/promocao"><input type=hidden name=preco_id value="${p.id}"><label>Dia</label><select name=dia_semana>${DIAS.map((d,i)=>`<option value="${i}">${d}</option>`).join('')}</select><label>A partir de quantas fotos?</label><input name=quantidade_min type=number value=1><label>Valor promocional unitário</label><input name=valor_unitario type=number step=.01><label>Ativo</label><select name=ativo><option value=1>Sim</option><option value=0>Não</option></select><button class=orange>Criar promoção</button></form></details></div></details>`}res.send(html('Preços',h))});
+app.post('/admin/precos/novo',adm,async(req,res)=>{let r=await run('INSERT INTO precos(tamanho,ativo) VALUES(?,1)',[limpar(req.body.tamanho)]);await run('INSERT INTO faixas_preco(preco_id,quantidade_min,valor_unitario) VALUES(?,?,?)',[r.lastID,1,Number(req.body.valor||0)]);res.redirect('/admin/precos')});
+app.post('/admin/precos/editar',adm,async(req,res)=>{await run('UPDATE precos SET tamanho=?,ativo=? WHERE id=?',[limpar(req.body.tamanho),Number(req.body.ativo),req.body.id]);res.redirect('/admin/precos')});
+app.post('/admin/precos/excluir',adm,async(req,res)=>{await run('DELETE FROM faixas_preco WHERE preco_id=?',[req.body.id]);await run('DELETE FROM promocoes WHERE preco_id=?',[req.body.id]);await run('DELETE FROM precos WHERE id=?',[req.body.id]);res.redirect('/admin/precos')});
+app.post('/admin/precos/faixa',adm,async(req,res)=>{await run('INSERT INTO faixas_preco(preco_id,quantidade_min,valor_unitario) VALUES(?,?,?)',[req.body.preco_id,Number(req.body.quantidade_min||1),Number(req.body.valor_unitario||0)]);res.redirect('/admin/precos')});
+app.post('/admin/precos/faixa/editar',adm,async(req,res)=>{await run('UPDATE faixas_preco SET quantidade_min=?,valor_unitario=? WHERE id=?',[Number(req.body.quantidade_min||1),Number(req.body.valor_unitario||0),req.body.id]);res.redirect('/admin/precos')});
+app.post('/admin/precos/faixa/excluir',adm,async(req,res)=>{await run('DELETE FROM faixas_preco WHERE id=?',[req.body.id]);res.redirect('/admin/precos')});
+app.post('/admin/precos/promocao',adm,async(req,res)=>{await run('INSERT INTO promocoes(preco_id,dia_semana,quantidade_min,valor_unitario,ativo) VALUES(?,?,?,?,?)',[req.body.preco_id,Number(req.body.dia_semana),Number(req.body.quantidade_min||1),Number(req.body.valor_unitario||0),Number(req.body.ativo)]);res.redirect('/admin/precos')});
+app.post('/admin/precos/promocao/editar',adm,async(req,res)=>{await run('UPDATE promocoes SET dia_semana=?,quantidade_min=?,valor_unitario=?,ativo=? WHERE id=?',[Number(req.body.dia_semana),Number(req.body.quantidade_min||1),Number(req.body.valor_unitario||0),Number(req.body.ativo),req.body.id]);res.redirect('/admin/precos')});
+app.post('/admin/precos/promocao/excluir',adm,async(req,res)=>{await run('DELETE FROM promocoes WHERE id=?',[req.body.id]);res.redirect('/admin/precos')});
+
+app.get('/admin/download/:data/:pedidoNome',adm,(req,res)=>{let pasta=path.join(P,req.params.data,req.params.pedidoNome);if(!fs.existsSync(pasta))return res.status(404).send('Pedido não encontrado');res.attachment(req.params.pedidoNome+'.zip');let archive=archiver('zip',{zlib:{level:9}});archive.on('error',err=>{console.log(err);res.status(500).send('Erro ao gerar ZIP')});archive.pipe(res);archive.directory(pasta,false);archive.finalize()});
+app.post('/admin/excluir/pedido',adm,async(req,res)=>{let p=await get('SELECT * FROM pedidos WHERE id=?',[req.body.id]);if(p){apagarPastaSegura(path.join(P,p.data_pasta,p.pasta_nome));await run('DELETE FROM pedidos WHERE id=?',[req.body.id])}res.redirect('/admin')});
+app.post('/admin/excluir/dia',adm,async(req,res)=>{let data=req.body.data,ped=await q('SELECT * FROM pedidos WHERE data_pasta=?',[data]);for(const p of ped)apagarPastaSegura(path.join(P,p.data_pasta,p.pasta_nome));await run('DELETE FROM pedidos WHERE data_pasta=?',[data]);let pd=path.join(P,data);if(fs.existsSync(pd)&&fs.readdirSync(pd).length===0)fs.rmSync(pd,{recursive:true,force:true});res.redirect('/admin')});
+app.post('/admin/excluir/mes',adm,async(req,res)=>{let mes=req.body.mes,ped=await q("SELECT * FROM pedidos WHERE data_pasta LIKE ?",[mes+'%']);for(const p of ped)apagarPastaSegura(path.join(P,p.data_pasta,p.pasta_nome));await run("DELETE FROM pedidos WHERE data_pasta LIKE ?",[mes+'%']);if(fs.existsSync(P))fs.readdirSync(P).filter(d=>d.startsWith(mes)).forEach(d=>{let pd=path.join(P,d);if(fs.existsSync(pd)&&fs.readdirSync(pd).length===0)fs.rmSync(pd,{recursive:true,force:true})});res.redirect('/admin')});
+
+// APIs para app desktop
+app.get('/api/admin/pedidos',async(req,res)=>{if(req.query.senha!==SENHA_ADMIN)return res.status(401).json({erro:'senha'});res.json(await q('SELECT * FROM pedidos ORDER BY id DESC'))});
+app.get('/api/admin/download/:data/:pedidoNome',(req,res)=>{if(req.query.senha!==SENHA_ADMIN)return res.status(401).send('senha');let pasta=path.join(P,req.params.data,req.params.pedidoNome);if(!fs.existsSync(pasta))return res.status(404).send('Pedido não encontrado');res.attachment(req.params.pedidoNome+'.zip');let archive=archiver('zip',{zlib:{level:9}});archive.pipe(res);archive.directory(pasta,false);archive.finalize()});
+app.post('/api/admin/status',async(req,res)=>{if(req.body.senha!==SENHA_ADMIN)return res.status(401).json({erro:'senha'});await run('UPDATE pedidos SET status=? WHERE numero=?',[req.body.status,req.body.numero]);res.json({ok:true})});
+app.post('/api/admin/excluir-pedido',async(req,res)=>{if(req.body.senha!==SENHA_ADMIN)return res.status(401).json({erro:'senha'});let p=await get('SELECT * FROM pedidos WHERE id=?',[req.body.id]);if(p){apagarPastaSegura(path.join(P,p.data_pasta,p.pasta_nome));await run('DELETE FROM pedidos WHERE id=?',[req.body.id])}res.json({ok:true})});
+
+app.listen(PORTA,()=>console.log('FotoTimer Admin Compacto rodando na porta '+PORTA));

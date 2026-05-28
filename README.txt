@@ -1,31 +1,31 @@
-FOTOTIMER ONLINE PRO
+FOTOTIMER ADMIN COMPACTO v5
 
-Recursos:
-- Login administrativo
-- Painel com pedidos
-- Status: Recebido, Em produção, Impresso, Entregue
-- Download ZIP do pedido completo
-- Etiqueta 10x5
-- Busca e filtro por status
-- Tamanho, quantidade, brilho/fosco, com borda/sem borda
-- Resumo automático
+Inclui:
+- Admin com menu lateral
+- Dashboard
+- Pedidos recolhíveis
+- Preços recolhíveis
+- Clientes em lista compacta
+- Controle de pagamento: Pendente, Pago, Parcial, Cancelado
+- Forma de pagamento: PIX, Dinheiro, Cartão, Link
+- Tabela de preços, pacotes e promoções
+- Limpeza de servidor: unitário, diário e mensal
+- APIs para o aplicativo Admin Desktop
 
-Como rodar:
+Como testar:
 npm install
 npm start
 
-Cliente:
-http://localhost:3000
-
-Painel:
+Admin:
 http://localhost:3000/admin
 
-Senha padrão:
+Senha:
 1234
 
-No Render:
-Build Command: npm install
-Start Command: npm start
 
-Para trocar senha:
-Environment > ADMIN_PASSWORD = sua_senha
+NOVO:
+- Página pública de preços para o cliente: /precos
+- Cliente visualiza pacotes e promoções semanais
+- Simulador de preço por tamanho e quantidade
+- Link de preços na página de envio
+
